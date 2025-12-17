@@ -1,10 +1,24 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  BashInput,
+  FileEditInput,
+  FileReadInput,
+  FileWriteInput,
+  KillShellInput,
+} from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import { z } from "zod";
-import { ClaudeAcpAgent } from "./acp-agent.js";
-import { ClientCapabilities, TerminalOutputResponse } from "@agentclientprotocol/sdk";
+import { CLAUDE_CONFIG_DIR, ClaudeAcpAgent } from "./acp-agent.js";
+import {
+  ClientCapabilities,
+  ReadTextFileResponse,
+  TerminalOutputResponse,
+} from "@agentclientprotocol/sdk";
 import * as diff from "diff";
+import * as path from "node:path";
+import * as fs from "node:fs/promises";
 
 import { sleep, unreachable, extractLinesWithByteLimit } from "./utils.js";
+import { acpToolNames } from "./tools.js";
 
 export const SYSTEM_REMINDER = `
 
@@ -23,23 +37,67 @@ const unqualifiedToolNames = {
   bashOutput: "BashOutput",
 };
 
-const SERVER_PREFIX = "mcp__acp__";
-export const toolNames = {
-  read: SERVER_PREFIX + unqualifiedToolNames.read,
-  edit: SERVER_PREFIX + unqualifiedToolNames.edit,
-  write: SERVER_PREFIX + unqualifiedToolNames.write,
-  bash: SERVER_PREFIX + unqualifiedToolNames.bash,
-  killShell: SERVER_PREFIX + unqualifiedToolNames.killShell,
-  bashOutput: SERVER_PREFIX + unqualifiedToolNames.bashOutput,
-};
-
-export const EDIT_TOOL_NAMES = [toolNames.edit, toolNames.write];
-
 export function createMcpServer(
   agent: ClaudeAcpAgent,
   sessionId: string,
   clientCapabilities: ClientCapabilities | undefined,
 ): McpServer {
+  /**
+   * This checks if a given path is related to internal agent persistence and if the agent should be allowed to read/write from here.
+   * We let the agent do normal fs operations on these paths so that it can persist its state.
+   * However, we block access to settings files for security reasons.
+   */
+  function internalPath(file_path: string) {
+    return (
+      file_path.startsWith(CLAUDE_CONFIG_DIR) &&
+      !file_path.startsWith(path.join(CLAUDE_CONFIG_DIR, "settings.json")) &&
+      !file_path.startsWith(path.join(CLAUDE_CONFIG_DIR, "session-env"))
+    );
+  }
+
+  async function readTextFile(input: FileReadInput): Promise<ReadTextFileResponse> {
+    if (internalPath(input.file_path)) {
+      const content = await fs.readFile(input.file_path, "utf8");
+
+      // eslint-disable-next-line eqeqeq
+      if (input.offset != null || input.limit != null) {
+        const lines = content.split("\n");
+
+        // Apply offset and limit if provided
+        const offset = input.offset ?? 1;
+        const limit = input.limit ?? lines.length;
+
+        // Extract the requested lines (offset is 1-based)
+        const startIndex = Math.max(0, offset - 1);
+        const endIndex = Math.min(lines.length, startIndex + limit);
+        const selectedLines = lines.slice(startIndex, endIndex);
+
+        return { content: selectedLines.join("\n") };
+      } else {
+        return { content };
+      }
+    }
+
+    return agent.readTextFile({
+      sessionId,
+      path: input.file_path,
+      line: input.offset,
+      limit: input.limit,
+    });
+  }
+
+  async function writeTextFile(input: FileWriteInput): Promise<void> {
+    if (internalPath(input.file_path)) {
+      await fs.writeFile(input.file_path, input.content, "utf8");
+    } else {
+      await agent.writeTextFile({
+        sessionId,
+        path: input.file_path,
+        content: input.content,
+      });
+    }
+  }
+
   // Create MCP server
   const server = new McpServer({ name: "acp", version: "1.0.0" }, { capabilities: { tools: {} } });
 
@@ -50,7 +108,7 @@ export function createMcpServer(
         title: unqualifiedToolNames.read,
         description: `Reads the content of the given file in the project.
 
-In sessions with ${toolNames.read} always use it instead of Read as it contains the most up-to-date contents.
+In sessions with ${acpToolNames.read} always use it instead of Read as it contains the most up-to-date contents.
 
 Reads a file from the local filesystem. If the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.
 
@@ -60,7 +118,7 @@ Usage:
 - You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters
 - Any files larger than ${defaults.maxFileSize} bytes will be truncated
 - This tool allows Claude Code to read images (eg PNG, JPG, etc). When reading an image file the contents are presented visually as Claude Code is a multimodal LLM.
-- This tool can only read files, not directories. To read a directory, use an ls command via the ${toolNames.bash} tool.
+- This tool can only read files, not directories. To read a directory, use an ls command via the ${acpToolNames.bash} tool.
 - You have the capability to call multiple tools in a single response. It is always better to speculatively read multiple files as a batch that are potentially useful.`,
         inputSchema: {
           file_path: z.string().describe("The absolute path to the file to read"),
@@ -87,7 +145,7 @@ Usage:
           idempotentHint: false,
         },
       },
-      async (input) => {
+      async (input: FileReadInput) => {
         try {
           const session = agent.sessions[sessionId];
           if (!session) {
@@ -101,12 +159,7 @@ Usage:
             };
           }
 
-          const readResponse = await agent.readTextFile({
-            sessionId,
-            path: input.file_path,
-            line: input.offset,
-            limit: input.limit,
-          });
+          const readResponse = await readTextFile(input);
 
           if (typeof readResponse?.content !== "string") {
             throw new Error(`No file contents for ${input.file_path}.`);
@@ -117,7 +170,7 @@ Usage:
 
           // Construct informative message about what was read
           let readInfo = "";
-          if (input.offset > 1 || result.wasLimited) {
+          if ((input.offset && input.offset > 1) || result.wasLimited) {
             readInfo = "\n\n<file-read-info>";
 
             if (result.wasLimited) {
@@ -162,12 +215,12 @@ Usage:
         title: unqualifiedToolNames.write,
         description: `Writes a file to the local filesystem..
 
-In sessions with ${toolNames.write} always use it instead of Write as it will
+In sessions with ${acpToolNames.write} always use it instead of Write as it will
 allow the user to conveniently review changes.
 
 Usage:
 - This tool will overwrite the existing file if there is one at the provided path.
-- If this is an existing file, you MUST use the ${toolNames.read} tool first to read the file's contents. This tool will fail if you did not read the file first.
+- If this is an existing file, you MUST use the ${acpToolNames.read} tool first to read the file's contents. This tool will fail if you did not read the file first.
 - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
 - NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.
 - Only use emojis if the user explicitly requests it. Avoid writing emojis to files unless asked.`,
@@ -185,7 +238,7 @@ Usage:
           idempotentHint: false,
         },
       },
-      async (input) => {
+      async (input: FileWriteInput) => {
         try {
           const session = agent.sessions[sessionId];
           if (!session) {
@@ -198,11 +251,7 @@ Usage:
               ],
             };
           }
-          await agent.writeTextFile({
-            sessionId,
-            path: input.file_path,
-            content: input.content,
-          });
+          await writeTextFile(input);
 
           return {
             content: [],
@@ -226,11 +275,11 @@ Usage:
         title: unqualifiedToolNames.edit,
         description: `Performs exact string replacements in files.
 
-In sessions with ${toolNames.edit} always use it instead of Edit as it will
+In sessions with ${acpToolNames.edit} always use it instead of Edit as it will
 allow the user to conveniently review changes.
 
 Usage:
-- You must use your \`${toolNames.read}\` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file.
+- You must use your \`${acpToolNames.read}\` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file.
 - When editing text from Read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears.
 - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
 - Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.
@@ -246,7 +295,7 @@ Usage:
             .boolean()
             .default(false)
             .optional()
-            .describe("Replace all occurences of old_string (default false)"),
+            .describe("Replace all occurrences of old_string (default false)"),
         },
         annotations: {
           title: "Edit file",
@@ -256,7 +305,7 @@ Usage:
           idempotentHint: false,
         },
       },
-      async (input) => {
+      async (input: FileEditInput) => {
         try {
           const session = agent.sessions[sessionId];
           if (!session) {
@@ -270,9 +319,8 @@ Usage:
             };
           }
 
-          const readResponse = await agent.readTextFile({
-            sessionId,
-            path: input.file_path,
+          const readResponse = await readTextFile({
+            file_path: input.file_path,
           });
 
           if (typeof readResponse?.content !== "string") {
@@ -289,11 +337,7 @@ Usage:
 
           const patch = diff.createPatch(input.file_path, readResponse.content, newContent);
 
-          await agent.writeTextFile({
-            sessionId,
-            path: input.file_path,
-            content: newContent,
-          });
+          await writeTextFile({ file_path: input.file_path, content: newContent });
 
           return {
             content: [
@@ -324,13 +368,10 @@ Usage:
         title: unqualifiedToolNames.bash,
         description: `Executes a bash command
 
-In sessions with ${toolNames.bash} always use it instead of Bash`,
+In sessions with ${acpToolNames.bash} always use it instead of Bash`,
         inputSchema: {
           command: z.string().describe("The command to execute"),
-          timeout: z
-            .number()
-            .default(2 * 60 * 1000)
-            .describe(`Optional timeout in milliseconds (max ${2 * 60 * 1000})`),
+          timeout: z.number().describe(`Optional timeout in milliseconds (max ${2 * 60 * 1000})`),
           description: z.string().optional()
             .describe(`Clear, concise description of what this command does in 5-10 words, in active voice. Examples:
 Input: ls
@@ -348,11 +389,11 @@ Output: Create directory 'foo'`),
             .boolean()
             .default(false)
             .describe(
-              `Set to true to run this command in the background. The tool returns an \`id\` that can be used with the \`${toolNames.bashOutput}\` tool to retrieve the current output, or the \`${toolNames.killShell}\` tool to stop it early.`,
+              `Set to true to run this command in the background. The tool returns an \`id\` that can be used with the \`${acpToolNames.bashOutput}\` tool to retrieve the current output, or the \`${acpToolNames.killShell}\` tool to stop it early.`,
             ),
         },
       },
-      async (input, extra) => {
+      async (input: BashInput, extra) => {
         const session = agent.sessions[sessionId];
         if (!session) {
           return {
@@ -406,7 +447,7 @@ Output: Create directory 'foo'`),
         const statusPromise = Promise.race([
           handle.waitForExit().then((exitStatus) => ({ status: "exited" as const, exitStatus })),
           abortPromise.then(() => ({ status: "aborted" as const, exitStatus: null })),
-          sleep(input.timeout).then(async () => {
+          sleep(input.timeout ?? 2 * 60 * 1000).then(async () => {
             if (agent.backgroundTerminals[handle.id]?.status === "started") {
               await handle.kill();
             }
@@ -475,23 +516,25 @@ Output: Create directory 'foo'`),
       {
         title: unqualifiedToolNames.bashOutput,
         description: `- Retrieves output from a running or completed background bash shell
-- Takes a shell_id parameter identifying the shell
+- Takes a bash_id parameter identifying the shell
 - Always returns only new output since the last check
 - Returns stdout and stderr output along with shell status
 - Use this tool when you need to monitor or check the output of a long-running shell
 
-In sessions with ${toolNames.bashOutput} always use it instead of BashOutput.`,
+In sessions with ${acpToolNames.bashOutput} always use it for output from Bash commands instead of TaskOutput.`,
         inputSchema: {
-          shell_id: z
+          bash_id: z
             .string()
-            .describe(`The id of the background bash command as returned by \`${toolNames.bash}\``),
+            .describe(
+              `The id of the background bash command as returned by \`${acpToolNames.bash}\``,
+            ),
         },
       },
       async (input) => {
-        const bgTerm = agent.backgroundTerminals[input.shell_id];
+        const bgTerm = agent.backgroundTerminals[input.bash_id];
 
         if (!bgTerm) {
-          throw new Error(`Unknown shell ${input.shell_id}`);
+          throw new Error(`Unknown shell ${input.bash_id}`);
         }
 
         if (bgTerm.status === "started") {
@@ -535,14 +578,16 @@ In sessions with ${toolNames.bashOutput} always use it instead of BashOutput.`,
 - Returns a success or failure status
 - Use this tool when you need to terminate a long-running shell
 
-In sessions with ${toolNames.killShell} always use it instead of KillShell.`,
+In sessions with ${acpToolNames.killShell} always use it instead of KillShell.`,
         inputSchema: {
           shell_id: z
             .string()
-            .describe(`The id of the background bash command as returned by \`${toolNames.bash}\``),
+            .describe(
+              `The id of the background bash command as returned by \`${acpToolNames.bash}\``,
+            ),
         },
       },
-      async (input) => {
+      async (input: KillShellInput) => {
         const bgTerm = agent.backgroundTerminals[input.shell_id];
 
         if (!bgTerm) {

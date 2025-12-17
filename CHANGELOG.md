@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.12.6
+
+- Fix model selection
+
+## 0.12.5
+
+- Update to @anthropic-ai/claude-agent-sdk@v0.1.70
+- Unstable implementation of resuming sessions
+
+## 0.12.4
+
+- Update to @anthropic-ai/claude-agent-sdk@v0.1.67
+- Better respect permissions specified in settings files
+- Unstable implementation of forking
+
+## 0.12.3
+
+- Update to @anthropic-ai/claude-agent-sdk@v0.1.65
+- Update to @agentclientprotocol/sdk@0.9.0
+- Allow agent to write plans and todos to its config directory
+- Fix experimental resume ids
+
+## 0.12.2
+
+- Fix duplicate tool use IDs error
+
+## 0.12.1
+
+- Update to @anthropic-ai/claude-agent-sdk@v0.1.61
+- Update to @agentclientprotocol/sdk@0.8.0
+
+## 0.12.0
+
+- Update to @anthropic-ai/claude-agent-sdk@v0.1.59
+  - Brings Opus to Claude Pro plans
+  - Support "Don't Ask" profile
+- Unify ACP + Claude Code session ids
+
+## 0.11.0
+
+- Update to @anthropic-ai/claude-agent-sdk@v0.1.57
+- Removed dependency on @anthropic-ai/claude-code since this is no longer needed
+
+## 0.10.10
+
+- Update to @agentclientprotocol/sdk@0.7.0
+
 ## 0.10.9
 
 - Update to @anthropic-ai/claude-agent-sdk@v0.1.55

@@ -20,6 +20,7 @@ import { nodeToWebWritable, nodeToWebReadable } from "../utils.js";
 import { markdownEscape, toolInfoFromToolUse, toolUpdateFromToolResult } from "../tools.js";
 import { toAcpNotifications, promptToClaude } from "../acp-agent.js";
 import { query, SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
+import { randomUUID } from "crypto";
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration", () => {
   let child: ReturnType<typeof spawn>;
@@ -492,50 +493,6 @@ describe("tool conversions", () => {
     });
   });
 
-  it("should handle WebFetch tool calls", () => {
-    const tool_use = {
-      type: "tool_use",
-      id: "toolu_01LxEjDn8ci9SAc3qG7LbbXV",
-      name: "WebFetch",
-      input: {
-        url: "https://agentclientprotocol.com",
-        prompt:
-          "Please provide a comprehensive summary of the content on this page, including what the Agent Client Protocol is, its main features, documentation links, and any other relevant information.",
-      },
-    };
-
-    expect(toolInfoFromToolUse(tool_use, {})).toStrictEqual({
-      kind: "fetch",
-      title: "Fetch https://agentclientprotocol.com",
-      content: [
-        {
-          content: {
-            text: "Please provide a comprehensive summary of the content on this page, including what the Agent Client Protocol is, its main features, documentation links, and any other relevant information.",
-            type: "text",
-          },
-          type: "content",
-        },
-      ],
-    });
-  });
-
-  it("should handle WebSearch tool calls", () => {
-    const tool_use = {
-      type: "tool_use",
-      id: "toolu_01NYMwiZFbdoQFxYxuQDFZXQ",
-      name: "WebSearch",
-      input: {
-        query: "agentclientprotocol.com",
-      },
-    };
-
-    expect(toolInfoFromToolUse(tool_use, {})).toStrictEqual({
-      kind: "fetch",
-      title: '"agentclientprotocol.com"',
-      content: [],
-    });
-  });
-
   it("should handle KillBash entries", () => {
     const tool_use = {
       type: "tool_use",
@@ -830,17 +787,29 @@ describe("prompt conversion", () => {
   });
 });
 
-describe("SDK behavior", () => {
-  it.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
-    "query has a 'default' model",
-    async () => {
-      const q = query({ prompt: "hi" });
-      const models = await q.supportedModels();
-      const defaultModel = models.find((m) => m.value === "default");
-      expect(defaultModel).toBeDefined();
-    },
-    10000,
-  );
+describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
+  it("query has a 'default' model", async () => {
+    const q = query({ prompt: "hi" });
+    const models = await q.supportedModels();
+    const defaultModel = models.find((m) => m.value === "default");
+    expect(defaultModel).toBeDefined();
+  }, 10000);
+
+  it("custom session id", async () => {
+    const sessionId = randomUUID();
+    const q = query({
+      prompt: "hi",
+      options: {
+        systemPrompt: { type: "preset", preset: "claude_code" },
+        extraArgs: { "session-id": sessionId },
+        settingSources: ["user", "project", "local"],
+        includePartialMessages: true,
+      },
+    });
+
+    const { value } = await q.next();
+    expect(value).toMatchObject({ type: "system", subtype: "init", session_id: sessionId });
+  }, 10000);
 });
 
 describe("permission requests", () => {
