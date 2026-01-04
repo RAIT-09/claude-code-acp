@@ -143,7 +143,6 @@ export class ClaudeAcpAgent implements Agent {
   };
   client: AgentSideConnection;
   toolUseCache: ToolUseCache;
-  fileContentCache: { [key: string]: string };
   backgroundTerminals: { [key: string]: BackgroundTerminal } = {};
   clientCapabilities?: ClientCapabilities;
   logger: Logger;
@@ -152,7 +151,6 @@ export class ClaudeAcpAgent implements Agent {
     this.sessions = {};
     this.client = client;
     this.toolUseCache = {};
-    this.fileContentCache = {};
     this.logger = logger ?? console;
   }
 
@@ -191,8 +189,7 @@ export class ClaudeAcpAgent implements Agent {
           sse: true,
         },
         sessionCapabilities: {
-          // TODO: announce fork capability when sessionId handling is fixed
-          // fork: {},
+          fork: {},
           resume: {},
         },
       },
@@ -330,7 +327,6 @@ export class ClaudeAcpAgent implements Agent {
             message,
             params.sessionId,
             this.toolUseCache,
-            this.fileContentCache,
             this.client,
             this.logger,
           )) {
@@ -394,7 +390,6 @@ export class ClaudeAcpAgent implements Agent {
             message.message.role,
             params.sessionId,
             this.toolUseCache,
-            this.fileContentCache,
             this.client,
             this.logger,
           )) {
@@ -459,15 +454,11 @@ export class ClaudeAcpAgent implements Agent {
 
   async readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
     const response = await this.client.readTextFile(params);
-    if (!params.limit && !params.line) {
-      this.fileContentCache[params.path] = response.content;
-    }
     return response;
   }
 
   async writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
     const response = await this.client.writeTextFile(params);
-    this.fileContentCache[params.path] = params.content;
     return response;
   }
 
@@ -497,11 +488,7 @@ export class ClaudeAcpAgent implements Agent {
           toolCall: {
             toolCallId: toolUseID,
             rawInput: toolInput,
-            title: toolInfoFromToolUse(
-              { name: toolName, input: toolInput },
-              this.fileContentCache,
-              this.logger,
-            ).title,
+            title: toolInfoFromToolUse({ name: toolName, input: toolInput }).title,
           },
         });
 
@@ -564,11 +551,7 @@ export class ClaudeAcpAgent implements Agent {
         toolCall: {
           toolCallId: toolUseID,
           rawInput: toolInput,
-          title: toolInfoFromToolUse(
-            { name: toolName, input: toolInput },
-            this.fileContentCache,
-            this.logger,
-          ).title,
+          title: toolInfoFromToolUse({ name: toolName, input: toolInput }).title,
         },
       });
       if (signal.aborted || response.outcome?.outcome === "cancelled") {
@@ -611,7 +594,17 @@ export class ClaudeAcpAgent implements Agent {
     params: NewSessionRequest,
     creationOpts: { resume?: string; forkSession?: boolean } = {},
   ): Promise<NewSessionResponse> {
-    const sessionId = creationOpts.resume ?? randomUUID();
+    // We want to create a new session id unless it is resume,
+    // but not resume + forkSession.
+    let sessionId;
+    if (creationOpts.forkSession) {
+      sessionId = randomUUID();
+    } else if (creationOpts.resume) {
+      sessionId = creationOpts.resume;
+    } else {
+      sessionId = randomUUID();
+    }
+
     const input = new Pushable<SDKUserMessage>();
 
     const settingsManager = new SettingsManager(params.cwd, {
@@ -672,9 +665,8 @@ export class ClaudeAcpAgent implements Agent {
     // Extract options from _meta if provided
     const userProvidedOptions = (params._meta as NewSessionMeta | undefined)?.claudeCode?.options;
     const extraArgs = { ...userProvidedOptions?.extraArgs };
-    if (creationOpts?.resume === undefined) {
+    if (creationOpts?.resume === undefined || creationOpts?.forkSession) {
       // Set our own session id if not resuming an existing session.
-      // TODO: find a way to make this work for fork
       extraArgs["session-id"] = sessionId;
     }
 
@@ -998,7 +990,6 @@ export function toAcpNotifications(
   role: "assistant" | "user",
   sessionId: string,
   toolUseCache: ToolUseCache,
-  fileContentCache: { [key: string]: string },
   client: AgentSideConnection,
   logger: Logger,
 ): SessionNotification[] {
@@ -1109,7 +1100,7 @@ export function toAcpNotifications(
             sessionUpdate: "tool_call",
             rawInput,
             status: "pending",
-            ...toolInfoFromToolUse(chunk, fileContentCache, logger),
+            ...toolInfoFromToolUse(chunk),
           };
         }
         break;
@@ -1172,7 +1163,6 @@ export function streamEventToAcpNotifications(
   message: SDKPartialAssistantMessage,
   sessionId: string,
   toolUseCache: ToolUseCache,
-  fileContentCache: { [key: string]: string },
   client: AgentSideConnection,
   logger: Logger,
 ): SessionNotification[] {
@@ -1184,7 +1174,6 @@ export function streamEventToAcpNotifications(
         "assistant",
         sessionId,
         toolUseCache,
-        fileContentCache,
         client,
         logger,
       );
@@ -1194,7 +1183,6 @@ export function streamEventToAcpNotifications(
         "assistant",
         sessionId,
         toolUseCache,
-        fileContentCache,
         client,
         logger,
       );
