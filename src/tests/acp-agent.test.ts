@@ -607,6 +607,9 @@ describe("tool conversions", () => {
           output_tokens: 1,
           service_tier: "standard",
           server_tool_use: null,
+          inference_geo: null,
+          iterations: null,
+          speed: null,
         },
         context_management: null,
       },
@@ -1001,7 +1004,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
       prompt: "hi",
       options: {
         systemPrompt: { type: "preset", preset: "claude_code" },
-        extraArgs: { "session-id": sessionId },
+        sessionId,
         settingSources: ["user", "project", "local"],
         includePartialMessages: true,
       },

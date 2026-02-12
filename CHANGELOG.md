@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.16.1
+
+- Update to @anthropic-ai/claude-agent-sdk@0.2.38
+- Fix incorrect paths for session/list
+- Fix available commands after loading a session
+- Make loading session more permissive for finding events
+- Fix overriding user-provided disallowedTools
+
+## 0.16.0
+
+- Update to @anthropic-ai/claude-agent-sdk@0.2.34
+- Experimental support for session loading
+
+## 0.15.0
+
+- Update to @anthropic-ai/claude-agent-sdk@0.2.32 (adds support for Opus 4.6 and 1M context Opus)
+
 ## 0.14.0
 
 - Update to @anthropic-ai/claude-agent-sdk@0.2.29
