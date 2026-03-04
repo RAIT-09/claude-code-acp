@@ -2,6 +2,7 @@ import {
   Agent,
   AgentSideConnection,
   AuthenticateRequest,
+  AuthMethod,
   AvailableCommand,
   CancelNotification,
   ClientCapabilities,
@@ -9,10 +10,10 @@ import {
   ForkSessionResponse,
   InitializeRequest,
   InitializeResponse,
-  LoadSessionRequest,
-  LoadSessionResponse,
   ListSessionsRequest,
   ListSessionsResponse,
+  LoadSessionRequest,
+  LoadSessionResponse,
   ndJsonStream,
   NewSessionRequest,
   NewSessionResponse,
@@ -23,9 +24,12 @@ import {
   RequestError,
   ResumeSessionRequest,
   ResumeSessionResponse,
-  SessionInfo,
+  SessionConfigOption,
   SessionModelState,
+  SessionModeState,
   SessionNotification,
+  SetSessionConfigOptionRequest,
+  SetSessionConfigOptionResponse,
   SetSessionModelRequest,
   SetSessionModelResponse,
   SetSessionModeRequest,
@@ -35,9 +39,10 @@ import {
   WriteTextFileRequest,
   WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
-import { SettingsManager } from "./settings.js";
 import {
   CanUseTool,
+  getSessionMessages,
+  listSessions,
   McpServerConfig,
   ModelInfo,
   Options,
@@ -45,45 +50,34 @@ import {
   Query,
   query,
   SDKPartialAssistantMessage,
+  SDKResultMessage,
   SDKUserMessage,
   SlashCommand,
 } from "@anthropic-ai/claude-agent-sdk";
-import * as fs from "node:fs";
-import * as path from "node:path";
-import * as readline from "node:readline";
-import * as os from "node:os";
-import {
-  encodeProjectPath,
-  nodeToWebReadable,
-  nodeToWebWritable,
-  Pushable,
-  unreachable,
-} from "./utils.js";
-import { createMcpServer } from "./mcp-server.js";
-import { EDIT_TOOL_NAMES, acpToolNames } from "./tools.js";
-import {
-  toolInfoFromToolUse,
-  planEntries,
-  toolUpdateFromToolResult,
-  ClaudePlanEntry,
-  registerHookCallback,
-  createPostToolUseHook,
-  createPreToolUseHook,
-} from "./tools.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
-import packageJson from "../package.json" with { type: "json" };
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import packageJson from "../package.json" with { type: "json" };
+import { SettingsManager } from "./settings.js";
+import {
+  ClaudePlanEntry,
+  createPostToolUseHook,
+  planEntries,
+  registerHookCallback,
+  toolInfoFromToolUse,
+  toolUpdateFromEditToolResponse,
+  toolUpdateFromToolResult,
+} from "./tools.js";
+import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
 
-function sessionFilePath(cwd: string, sessionId: string): string {
-  return path.join(CLAUDE_CONFIG_DIR, "projects", encodeProjectPath(cwd), `${sessionId}.jsonl`);
-}
-
-const MAX_TITLE_LENGTH = 128;
+const MAX_TITLE_LENGTH = 256;
 
 function sanitizeTitle(text: string): string {
   // Replace newlines and collapse whitespace
@@ -105,23 +99,24 @@ export interface Logger {
   error: (...args: any[]) => void;
 }
 
+type AccumulatedUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cachedReadTokens: number;
+  cachedWriteTokens: number;
+};
+
 type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
   permissionMode: PermissionMode;
   settingsManager: SettingsManager;
-};
-
-type SessionHistoryEntry = {
-  type?: string;
-  isSidechain?: boolean;
-  sessionId?: string;
-  message?: {
-    role?: string;
-    content?: unknown;
-    model?: string;
-  };
+  accumulatedUsage: AccumulatedUsage;
+  configOptions: SessionConfigOption[];
+  promptRunning: boolean;
+  pendingMessages: Map<string, { resolve: (cancelled: boolean) => void; order: number }>;
+  nextPendingOrder: number;
 };
 
 type BackgroundTerminal =
@@ -136,7 +131,7 @@ type BackgroundTerminal =
     };
 
 /**
- * Extra metadata that can be given to Claude Code when creating a new session.
+ * Extra metadata that can be given when creating a new session.
  */
 export type NewSessionMeta = {
   claudeCode?: {
@@ -159,6 +154,34 @@ export type NewSessionMeta = {
 };
 
 /**
+ * Extended ClientCapabilities with `auth` field.
+ * TODO: Remove once `auth` is added to the ACP SDK schema.
+ */
+type ClientCapabilitiesWithAuth = ClientCapabilities & {
+  auth?: {
+    _meta?: {
+      gateway?: boolean;
+    };
+  };
+};
+
+/**
+ * Extra metadata for 'gateway' authentication requests.
+ */
+type GatewayAuthMeta = {
+  /**
+   * These parameters are mapped to environment variables to:
+   * - Redirect API calls via baseUrl
+   * - Inject custom headers
+   * - Bypass the default Claude login requirement
+   */
+  gateway: {
+    baseUrl: string;
+    headers: Record<string, string>;
+  };
+};
+
+/**
  * Extra metadata that the agent provides for each tool_call / tool_update update.
  */
 export type ToolUpdateMeta = {
@@ -167,6 +190,19 @@ export type ToolUpdateMeta = {
     toolName: string;
     /* The structured output provided by Claude Code. */
     toolResponse?: unknown;
+  };
+  /* Terminal metadata for Bash tool execution, matching codex-acp's _meta protocol. */
+  terminal_info?: {
+    terminal_id: string;
+  };
+  terminal_output?: {
+    terminal_id: string;
+    data: string;
+  };
+  terminal_exit?: {
+    terminal_id: string;
+    exit_code: number;
+    signal: string | null;
   };
 };
 
@@ -179,9 +215,54 @@ export type ToolUseCache = {
   };
 };
 
+function isStaticBinary(): boolean {
+  return process.env.CLAUDE_AGENT_ACP_IS_SINGLE_FILE_BUN !== undefined;
+}
+
+function shouldHideClaudeAuth(): boolean {
+  return process.argv.includes("--hide-claude-auth");
+}
+
 // Bypass Permissions doesn't work if we are a root/sudo user
 const IS_ROOT = (process.geteuid?.() ?? process.getuid?.()) === 0;
 const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
+
+const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
+  default: "default",
+  acceptedits: "acceptEdits",
+  dontask: "dontAsk",
+  plan: "plan",
+  bypasspermissions: "bypassPermissions",
+  bypass: "bypassPermissions",
+};
+
+export function resolvePermissionMode(defaultMode?: unknown): PermissionMode {
+  if (defaultMode === undefined) {
+    return "default";
+  }
+
+  if (typeof defaultMode !== "string") {
+    throw new Error("Invalid permissions.defaultMode: expected a string.");
+  }
+
+  const normalized = defaultMode.trim().toLowerCase();
+  if (normalized === "") {
+    throw new Error("Invalid permissions.defaultMode: expected a non-empty string.");
+  }
+
+  const mapped = PERMISSION_MODE_ALIASES[normalized];
+  if (!mapped) {
+    throw new Error(`Invalid permissions.defaultMode: ${defaultMode}.`);
+  }
+
+  if (mapped === "bypassPermissions" && !ALLOW_BYPASS) {
+    throw new Error(
+      "Invalid permissions.defaultMode: bypassPermissions is not available when running as root.",
+    );
+  }
+
+  return mapped;
+}
 
 // Implement the ACP Agent interface
 export class ClaudeAcpAgent implements Agent {
@@ -193,6 +274,7 @@ export class ClaudeAcpAgent implements Agent {
   backgroundTerminals: { [key: string]: BackgroundTerminal } = {};
   clientCapabilities?: ClientCapabilities;
   logger: Logger;
+  gatewayAuthMeta?: GatewayAuthMeta;
 
   constructor(client: AgentSideConnection, logger?: Logger) {
     this.sessions = {};
@@ -207,19 +289,46 @@ export class ClaudeAcpAgent implements Agent {
     // Default authMethod
     const authMethod: any = {
       description: "Run `claude /login` in the terminal",
-      name: "Log in with Claude Code",
+      name: "Log in with Claude",
       id: "claude-login",
     };
 
+    // Bypasses standard auth by routing requests through a custom Anthropic-protocol gateway.
+    // Only offered when the client advertises `auth._meta.gateway` capability.
+    const clientCaps = request.clientCapabilities as ClientCapabilitiesWithAuth | undefined;
+    const supportsGatewayAuth = clientCaps?.auth?._meta?.gateway === true;
+
+    const gatewayAuthMethod: AuthMethod = {
+      id: "gateway",
+      name: "Custom model gateway",
+      description: "Use a custom gateway to authenticate and access models",
+      _meta: {
+        gateway: {
+          protocol: "anthropic",
+        },
+      },
+    };
+
     // If client supports terminal-auth capability, use that instead.
-    if (request.clientCapabilities?._meta?.["terminal-auth"] === true) {
-      const cliPath = fileURLToPath(import.meta.resolve("@anthropic-ai/claude-agent-sdk/cli.js"));
+    const supportsTerminalAuth = request.clientCapabilities?._meta?.["terminal-auth"] === true;
+    if (supportsTerminalAuth) {
+      let command: string;
+      let args: string[];
+
+      if (isStaticBinary()) {
+        command = process.execPath;
+        args = ["--cli"];
+      } else {
+        const cliPath = fileURLToPath(import.meta.resolve("@anthropic-ai/claude-agent-sdk/cli.js"));
+        command = "node";
+        args = [cliPath];
+      }
 
       authMethod._meta = {
         "terminal-auth": {
-          command: "node",
-          args: [cliPath, "/login"],
-          label: "Claude Code Login",
+          command,
+          args,
+          label: "Claude Login",
         },
       };
     }
@@ -227,6 +336,11 @@ export class ClaudeAcpAgent implements Agent {
     return {
       protocolVersion: 1,
       agentCapabilities: {
+        _meta: {
+          claudeCode: {
+            promptQueueing: true,
+          },
+        },
         promptCapabilities: {
           image: true,
           embeddedContext: true,
@@ -244,15 +358,20 @@ export class ClaudeAcpAgent implements Agent {
       },
       agentInfo: {
         name: packageJson.name,
-        title: "Claude Code",
+        title: "Claude Agent",
         version: packageJson.version,
       },
-      authMethods: [authMethod],
+      authMethods: [
+        // Terminal auth can also be used for API keys, so don't gate it on --hide-claude-auth.
+        ...(shouldHideClaudeAuth() && !supportsTerminalAuth ? [] : [authMethod]),
+        ...(supportsGatewayAuth ? [gatewayAuthMethod] : []),
+      ],
     };
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     if (
+      !this.gatewayAuthMeta &&
       fs.existsSync(path.resolve(os.homedir(), ".claude.json.backup")) &&
       !fs.existsSync(path.resolve(os.homedir(), ".claude.json"))
     ) {
@@ -307,52 +426,7 @@ export class ClaudeAcpAgent implements Agent {
     return response;
   }
 
-  /**
-   * Find a session file by ID, first checking the given cwd's project directory,
-   * then falling back to scanning all project directories.
-   * Returns the absolute file path if found, or null if not found.
-   */
-  private async findSessionFile(sessionId: string, cwd: string): Promise<string | null> {
-    const fileName = `${sessionId}.jsonl`;
-
-    // Fast path: check the expected location based on cwd
-    const expectedPath = sessionFilePath(cwd, sessionId);
-    try {
-      await fs.promises.access(expectedPath);
-      return expectedPath;
-    } catch {
-      // Not found at expected path, scan all project directories
-    }
-
-    const claudeDir = path.join(CLAUDE_CONFIG_DIR, "projects");
-    try {
-      const projectDirs = await fs.promises.readdir(claudeDir);
-      for (const encodedPath of projectDirs) {
-        const projectDir = path.join(claudeDir, encodedPath);
-        const stat = await fs.promises.stat(projectDir);
-        if (!stat.isDirectory()) continue;
-
-        const candidatePath = path.join(projectDir, fileName);
-        try {
-          await fs.promises.access(candidatePath);
-          return candidatePath;
-        } catch {
-          continue;
-        }
-      }
-    } catch {
-      // projects directory doesn't exist or isn't readable
-    }
-
-    return null;
-  }
-
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
-    const filePath = await this.findSessionFile(params.sessionId, params.cwd);
-    if (!filePath) {
-      throw new Error("Session not found");
-    }
-
     const response = await this.createSession(
       {
         cwd: params.cwd,
@@ -364,7 +438,7 @@ export class ClaudeAcpAgent implements Agent {
       },
     );
 
-    await this.replaySessionHistory(params.sessionId, filePath);
+    await this.replaySessionHistory(params.sessionId);
 
     // Send available commands after replay so it doesn't interleave with history
     setTimeout(() => {
@@ -374,362 +448,407 @@ export class ClaudeAcpAgent implements Agent {
     return {
       modes: response.modes,
       models: response.models,
+      configOptions: response.configOptions,
     };
   }
 
-  /**
-   * List Claude Code sessions by parsing JSONL files
-   * Sessions are stored in ~/.claude/projects/<path-encoded>/
-   * Implements the draft session/list RFD spec
-   */
   async unstable_listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
-    // Note: We load all sessions into memory for sorting, so pagination here is for
-    // API response size limits rather than memory efficiency. This matches the RFD spec.
-    const PAGE_SIZE = 50;
-    const claudeDir = path.join(CLAUDE_CONFIG_DIR, "projects");
+    const sdk_sessions = await listSessions({ dir: params.cwd ?? undefined });
+    const sessions = [];
 
-    try {
-      await fs.promises.access(claudeDir);
-    } catch {
-      return { sessions: [] };
+    for (const session of sdk_sessions) {
+      if (!session.cwd) continue;
+      sessions.push({
+        sessionId: session.sessionId,
+        cwd: session.cwd,
+        title: sanitizeTitle(session.summary),
+        updatedAt: new Date(session.lastModified).toISOString(),
+      });
     }
-
-    // Collect all sessions across all project directories
-    const allSessions: SessionInfo[] = [];
-    const encodedCwdFilter = params.cwd ? encodeProjectPath(params.cwd) : null;
-
-    try {
-      const projectDirs = await fs.promises.readdir(claudeDir);
-
-      for (const encodedPath of projectDirs) {
-        const projectDir = path.join(claudeDir, encodedPath);
-        const stat = await fs.promises.stat(projectDir);
-        if (!stat.isDirectory()) continue;
-
-        // Path encoding is not always reversible (hyphens can be separators or literals),
-        // so only use encoded value as a coarse pre-filter.
-        if (encodedCwdFilter && encodedPath !== encodedCwdFilter) continue;
-
-        const files = await fs.promises.readdir(projectDir);
-        // Filter to user session files only. Skip agent-*.jsonl files which contain
-        // internal agent metadata and system logs, not user-visible conversation sessions.
-        const jsonlFiles = files.filter((f) => f.endsWith(".jsonl") && !f.startsWith("agent-"));
-
-        for (const file of jsonlFiles) {
-          const filePath = path.join(projectDir, file);
-          try {
-            const content = await fs.promises.readFile(filePath, "utf-8");
-            const lines = content.trim().split("\n").filter(Boolean);
-
-            const sessionId = file.replace(".jsonl", "");
-            let parsedAnyEntry = false;
-            let sessionCwd: string | undefined;
-
-            // Find first user message for title
-            let title: string | undefined;
-            for (const line of lines) {
-              try {
-                const entry = JSON.parse(line);
-                parsedAnyEntry = true;
-                if (entry.isSidechain === true) {
-                  continue;
-                }
-                const entrySessionId =
-                  typeof entry.sessionId === "string" ? entry.sessionId : undefined;
-                if (typeof entry.sessionId === "string" && entry.sessionId !== entrySessionId) {
-                  continue;
-                }
-                if (typeof entry.cwd === "string") {
-                  sessionCwd = entry.cwd;
-                }
-                if (!title && entry.type === "user" && entry.message?.content) {
-                  const msgContent = entry.message.content;
-                  if (typeof msgContent === "string") {
-                    title = sanitizeTitle(msgContent);
-                  }
-                  if (Array.isArray(msgContent) && msgContent.length > 0) {
-                    const first = msgContent[0];
-                    const text =
-                      typeof first === "string"
-                        ? first
-                        : first && typeof first === "object" && typeof first.text === "string"
-                          ? first.text
-                          : undefined;
-                    if (text) {
-                      title = sanitizeTitle(text);
-                    }
-                  }
-                }
-
-                // Continue scanning until we have both fields, since cwd can appear
-                // in later entries even after the first user title-bearing message.
-                if (title && sessionCwd) {
-                  break;
-                }
-              } catch {
-                // Skip malformed lines
-              }
-            }
-            if (!parsedAnyEntry) continue;
-
-            // SessionInfo.cwd is currently required. For entries that do not
-            // include an explicit cwd in the session JSONL (typically metadata-only files),
-            // we skip them instead of decoding folder names because path encoding is lossy.
-            if (!sessionCwd) continue;
-
-            // Even after encoded-path pre-filtering, verify per-entry cwd to disambiguate
-            // collisions such as "/a-b" and "/a/b" that map to the same encoded folder name.
-            if (params.cwd && sessionCwd !== params.cwd) continue;
-
-            // Get file modification time as updatedAt
-            const fileStat = await fs.promises.stat(filePath);
-            const updatedAt = fileStat.mtime.toISOString();
-
-            allSessions.push({
-              sessionId,
-              cwd: sessionCwd,
-              title: title ?? null,
-              updatedAt,
-            });
-          } catch (err) {
-            this.logger.error(
-              `[unstable_listSessions] Failed to parse session file: ${filePath}`,
-              err,
-            );
-          }
-        }
-      }
-    } catch (err) {
-      this.logger.error("[unstable_listSessions] Failed to list sessions", err);
-      return { sessions: [] };
-    }
-
-    // Sort by updatedAt descending (most recent first)
-    allSessions.sort((a, b) => {
-      const timeA = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
-      const timeB = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
-      return timeB - timeA;
-    });
-
-    // Handle pagination with cursor
-    let startIndex = 0;
-    if (params.cursor) {
-      try {
-        const decoded = Buffer.from(params.cursor, "base64").toString("utf-8");
-        const cursorData = JSON.parse(decoded);
-        startIndex = cursorData.offset ?? 0;
-      } catch {
-        // Invalid cursor, start from beginning
-      }
-    }
-
-    const pageOfSessions = allSessions.slice(startIndex, startIndex + PAGE_SIZE);
-    const hasMore = startIndex + PAGE_SIZE < allSessions.length;
-
-    const response: ListSessionsResponse = {
-      sessions: pageOfSessions,
+    return {
+      sessions,
     };
-
-    if (hasMore) {
-      const nextCursor = Buffer.from(JSON.stringify({ offset: startIndex + PAGE_SIZE })).toString(
-        "base64",
-      );
-      response.nextCursor = nextCursor;
-    }
-
-    return response;
   }
 
   async authenticate(_params: AuthenticateRequest): Promise<void> {
+    if (_params.methodId === "gateway") {
+      this.gatewayAuthMeta = _params._meta as GatewayAuthMeta | undefined;
+      return;
+    }
     throw new Error("Method not implemented.");
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
-    if (!this.sessions[params.sessionId]) {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
       throw new Error("Session not found");
     }
 
-    this.sessions[params.sessionId].cancelled = false;
+    session.cancelled = false;
+    session.accumulatedUsage = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+    };
 
-    const { query, input } = this.sessions[params.sessionId];
+    let lastAssistantTotalUsage: number | null = null;
 
-    input.push(promptToClaude(params));
-    while (true) {
-      const { value: message, done } = await query.next();
-      if (done || !message) {
-        if (this.sessions[params.sessionId].cancelled) {
-          return { stopReason: "cancelled" };
-        }
-        break;
+    const userMessage = promptToClaude(params);
+
+    if (session.promptRunning) {
+      const uuid = randomUUID();
+      userMessage.uuid = uuid;
+      session.input.push(userMessage);
+      const order = session.nextPendingOrder++;
+      const cancelled = await new Promise<boolean>((resolve) => {
+        session.pendingMessages.set(uuid, { resolve, order });
+      });
+      if (cancelled) {
+        return { stopReason: "cancelled" };
       }
+    } else {
+      session.input.push(userMessage);
+    }
 
-      switch (message.type) {
-        case "system":
-          switch (message.subtype) {
-            case "init":
-              break;
-            case "compact_boundary":
-            case "hook_started":
-            case "task_notification":
-            case "hook_progress":
-            case "hook_response":
-            case "status":
-            case "files_persisted":
-              // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
-              break;
-            default:
-              unreachable(message, this.logger);
-              break;
-          }
-          break;
-        case "result": {
-          if (this.sessions[params.sessionId].cancelled) {
+    session.promptRunning = true;
+    let handedOff = false;
+
+    try {
+      while (true) {
+        const { value: message, done } = await session.query.next();
+
+        if (done || !message) {
+          if (session.cancelled) {
             return { stopReason: "cancelled" };
           }
+          break;
+        }
 
-          switch (message.subtype) {
-            case "success": {
-              if (message.result.includes("Please run /login")) {
-                throw RequestError.authRequired();
+        switch (message.type) {
+          case "system":
+            switch (message.subtype) {
+              case "init":
+                break;
+              case "status": {
+                if (message.status === "compacting") {
+                  await this.client.sessionUpdate({
+                    sessionId: message.session_id,
+                    update: {
+                      sessionUpdate: "agent_message_chunk",
+                      content: { type: "text", text: "Compacting..." },
+                    },
+                  });
+                }
+                break;
               }
-              if (message.is_error) {
-                throw RequestError.internalError(undefined, message.result);
+              case "compact_boundary": {
+                // We don't know the exact size, but since we compacted,
+                // we set it to zero. The client gets the exact size on the next message.
+                lastAssistantTotalUsage = 0;
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "agent_message_chunk",
+                    content: { type: "text", text: "\n\nCompacting completed." },
+                  },
+                });
+                break;
               }
-              return { stopReason: "end_turn" };
+              case "local_command_output": {
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "agent_message_chunk",
+                    content: { type: "text", text: message.content },
+                  },
+                });
+                break;
+              }
+              case "hook_started":
+              case "hook_progress":
+              case "hook_response":
+              case "files_persisted":
+              case "task_started":
+              case "task_notification":
+              case "task_progress":
+              case "elicitation_complete":
+                // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
+                break;
+              default:
+                unreachable(message, this.logger);
+                break;
             }
-            case "error_during_execution":
-              if (message.is_error) {
-                throw RequestError.internalError(
-                  undefined,
-                  message.errors.join(", ") || message.subtype,
-                );
+            break;
+          case "result": {
+            if (session.cancelled) {
+              return { stopReason: "cancelled" };
+            }
+
+            // Accumulate usage from this result
+            session.accumulatedUsage.inputTokens += message.usage.input_tokens;
+            session.accumulatedUsage.outputTokens += message.usage.output_tokens;
+            session.accumulatedUsage.cachedReadTokens += message.usage.cache_read_input_tokens;
+            session.accumulatedUsage.cachedWriteTokens += message.usage.cache_creation_input_tokens;
+
+            // Calculate context window size from modelUsage (minimum across all models used)
+            const contextWindows = Object.values(message.modelUsage).map((m) => m.contextWindow);
+            const contextWindowSize =
+              contextWindows.length > 0 ? Math.min(...contextWindows) : 200000;
+
+            // Send usage_update notification
+            if (lastAssistantTotalUsage !== null) {
+              await this.client.sessionUpdate({
+                sessionId: params.sessionId,
+                update: {
+                  sessionUpdate: "usage_update",
+                  used: lastAssistantTotalUsage,
+                  size: contextWindowSize,
+                  cost: {
+                    amount: message.total_cost_usd,
+                    currency: "USD",
+                  },
+                },
+              });
+            }
+
+            // Build the usage response
+            const usage: PromptResponse["usage"] = {
+              inputTokens: session.accumulatedUsage.inputTokens,
+              outputTokens: session.accumulatedUsage.outputTokens,
+              cachedReadTokens: session.accumulatedUsage.cachedReadTokens,
+              cachedWriteTokens: session.accumulatedUsage.cachedWriteTokens,
+              totalTokens:
+                session.accumulatedUsage.inputTokens +
+                session.accumulatedUsage.outputTokens +
+                session.accumulatedUsage.cachedReadTokens +
+                session.accumulatedUsage.cachedWriteTokens,
+            };
+
+            switch (message.subtype) {
+              case "success": {
+                if (message.result.includes("Please run /login")) {
+                  throw RequestError.authRequired();
+                }
+                if (message.stop_reason === "max_tokens") {
+                  return { stopReason: "max_tokens", usage };
+                }
+                if (message.is_error) {
+                  throw RequestError.internalError(undefined, message.result);
+                }
+                return { stopReason: "end_turn", usage };
               }
-              return { stopReason: "end_turn" };
-            case "error_max_budget_usd":
-            case "error_max_turns":
-            case "error_max_structured_output_retries":
-              if (message.is_error) {
-                throw RequestError.internalError(
-                  undefined,
-                  message.errors.join(", ") || message.subtype,
-                );
-              }
-              return { stopReason: "max_turn_requests" };
-            default:
-              unreachable(message, this.logger);
+              case "error_during_execution":
+                if (message.stop_reason === "max_tokens") {
+                  return { stopReason: "max_tokens", usage };
+                }
+                if (message.is_error) {
+                  throw RequestError.internalError(
+                    undefined,
+                    message.errors.join(", ") || message.subtype,
+                  );
+                }
+                return { stopReason: "end_turn", usage };
+              case "error_max_budget_usd":
+              case "error_max_turns":
+              case "error_max_structured_output_retries":
+                if (message.is_error) {
+                  throw RequestError.internalError(
+                    undefined,
+                    message.errors.join(", ") || message.subtype,
+                  );
+                }
+                return { stopReason: "max_turn_requests", usage };
+              default:
+                unreachable(message, this.logger);
+                break;
+            }
+            break;
+          }
+          case "stream_event": {
+            for (const notification of streamEventToAcpNotifications(
+              message,
+              params.sessionId,
+              this.toolUseCache,
+              this.client,
+              this.logger,
+              { clientCapabilities: this.clientCapabilities },
+            )) {
+              await this.client.sessionUpdate(notification);
+            }
+            break;
+          }
+          case "user":
+          case "assistant": {
+            if (session.cancelled) {
               break;
-          }
-          break;
-        }
-        case "stream_event": {
-          for (const notification of streamEventToAcpNotifications(
-            message,
-            params.sessionId,
-            this.toolUseCache,
-            this.client,
-            this.logger,
-          )) {
-            await this.client.sessionUpdate(notification);
-          }
-          break;
-        }
-        case "user":
-        case "assistant": {
-          if (this.sessions[params.sessionId].cancelled) {
-            break;
-          }
+            }
 
-          // Slash commands like /compact can generate invalid output... doesn't match
-          // their own docs: https://docs.anthropic.com/en/docs/claude-code/sdk/sdk-slash-commands#%2Fcompact-compact-conversation-history
-          if (
-            typeof message.message.content === "string" &&
-            message.message.content.includes("<local-command-stdout>")
-          ) {
-            // Handle /context by sending its reply as regular agent message.
-            if (message.message.content.includes("Context Usage")) {
-              for (const notification of toAcpNotifications(
-                message.message.content
-                  .replace("<local-command-stdout>", "")
-                  .replace("</local-command-stdout>", ""),
-                "assistant",
-                params.sessionId,
-                this.toolUseCache,
-                this.client,
-                this.logger,
-              )) {
-                await this.client.sessionUpdate(notification);
+            // Check for queued prompt replay
+            if (message.type === "user" && "uuid" in message && message.uuid) {
+              const pending = session.pendingMessages.get(message.uuid as string);
+              if (pending) {
+                pending.resolve(false);
+                session.pendingMessages.delete(message.uuid as string);
+                handedOff = true;
+                // the current loop stops with end_turn,
+                // the loop of the next prompt continues running
+                return { stopReason: "end_turn" };
               }
             }
-            this.logger.log(message.message.content);
+
+            // Store latest assistant usage (excluding subagents)
+            if ((message.message as any).usage && message.parent_tool_use_id === null) {
+              const messageWithUsage = message.message as unknown as SDKResultMessage;
+              lastAssistantTotalUsage =
+                messageWithUsage.usage.input_tokens +
+                messageWithUsage.usage.output_tokens +
+                messageWithUsage.usage.cache_read_input_tokens +
+                messageWithUsage.usage.cache_creation_input_tokens;
+            }
+
+            // Slash commands like /compact can generate invalid output... doesn't match
+            // their own docs: https://docs.anthropic.com/en/docs/claude-code/sdk/sdk-slash-commands#%2Fcompact-compact-conversation-history
+            if (
+              typeof message.message.content === "string" &&
+              message.message.content.includes("<local-command-stdout>")
+            ) {
+              // Handle /context by sending its reply as regular agent message.
+              if (message.message.content.includes("Context Usage")) {
+                for (const notification of toAcpNotifications(
+                  message.message.content
+                    .replace("<local-command-stdout>", "")
+                    .replace("</local-command-stdout>", ""),
+                  "assistant",
+                  params.sessionId,
+                  this.toolUseCache,
+                  this.client,
+                  this.logger,
+                  { clientCapabilities: this.clientCapabilities },
+                )) {
+                  await this.client.sessionUpdate(notification);
+                }
+              }
+              this.logger.log(message.message.content);
+              break;
+            }
+
+            if (
+              typeof message.message.content === "string" &&
+              message.message.content.includes("<local-command-stderr>")
+            ) {
+              this.logger.error(message.message.content);
+              break;
+            }
+            // Skip these user messages for now, since they seem to just be messages we don't want in the feed
+            if (
+              message.type === "user" &&
+              (typeof message.message.content === "string" ||
+                (Array.isArray(message.message.content) &&
+                  message.message.content.length === 1 &&
+                  message.message.content[0].type === "text"))
+            ) {
+              break;
+            }
+
+            if (
+              message.type === "assistant" &&
+              message.message.model === "<synthetic>" &&
+              Array.isArray(message.message.content) &&
+              message.message.content.length === 1 &&
+              message.message.content[0].type === "text" &&
+              message.message.content[0].text.includes("Please run /login")
+            ) {
+              throw RequestError.authRequired();
+            }
+
+            const content =
+              message.type === "assistant"
+                ? // Handled by stream events above
+                  message.message.content.filter(
+                    (item) => !["text", "thinking"].includes(item.type),
+                  )
+                : message.message.content;
+
+            for (const notification of toAcpNotifications(
+              content,
+              message.message.role,
+              params.sessionId,
+              this.toolUseCache,
+              this.client,
+              this.logger,
+              {
+                clientCapabilities: this.clientCapabilities,
+                parentToolUseId: message.parent_tool_use_id,
+              },
+            )) {
+              await this.client.sessionUpdate(notification);
+            }
             break;
           }
-
-          if (
-            typeof message.message.content === "string" &&
-            message.message.content.includes("<local-command-stderr>")
-          ) {
-            this.logger.error(message.message.content);
+          case "tool_progress":
+          case "tool_use_summary":
+          case "auth_status":
+          case "prompt_suggestion":
+          case "rate_limit_event":
             break;
-          }
-          // Skip these user messages for now, since they seem to just be messages we don't want in the feed
-          if (
-            message.type === "user" &&
-            (typeof message.message.content === "string" ||
-              (Array.isArray(message.message.content) &&
-                message.message.content.length === 1 &&
-                message.message.content[0].type === "text"))
-          ) {
+          default:
+            unreachable(message);
             break;
-          }
-
-          if (
-            message.type === "assistant" &&
-            message.message.model === "<synthetic>" &&
-            Array.isArray(message.message.content) &&
-            message.message.content.length === 1 &&
-            message.message.content[0].type === "text" &&
-            message.message.content[0].text.includes("Please run /login")
-          ) {
-            throw RequestError.authRequired();
-          }
-
-          const content =
-            message.type === "assistant"
-              ? // Handled by stream events above
-                message.message.content.filter((item) => !["text", "thinking"].includes(item.type))
-              : message.message.content;
-
-          for (const notification of toAcpNotifications(
-            content,
-            message.message.role,
-            params.sessionId,
-            this.toolUseCache,
-            this.client,
-            this.logger,
-          )) {
-            await this.client.sessionUpdate(notification);
-          }
-          break;
         }
-        case "tool_progress":
-        case "tool_use_summary":
-          break;
-        case "auth_status":
-          break;
-        default:
-          unreachable(message);
-          break;
+      }
+      throw new Error("Session did not end in result");
+    } catch (error) {
+      if (error instanceof RequestError || !(error instanceof Error)) {
+        throw error;
+      }
+      const message = error.message;
+      if (
+        message.includes("ProcessTransport") ||
+        message.includes("terminated process") ||
+        message.includes("process exited with") ||
+        message.includes("process terminated by signal") ||
+        message.includes("Failed to write to process stdin")
+      ) {
+        this.logger.error(`Session ${params.sessionId}: Claude Agent process died: ${message}`);
+        session.input.end();
+        delete this.sessions[params.sessionId];
+        throw RequestError.internalError(
+          undefined,
+          "The Claude Agent process exited unexpectedly. Please start a new session.",
+        );
+      }
+      throw error;
+    } finally {
+      if (!handedOff) {
+        session.promptRunning = false;
+        // This usually should not happen, but in case the loop finishes
+        // without claude sending all message replays, we resolve the
+        // next pending prompt call to ensure no prompts get stuck.
+        if (session.pendingMessages.size > 0) {
+          const next = [...session.pendingMessages.entries()].sort(
+            (a, b) => a[1].order - b[1].order,
+          )[0];
+          if (next) {
+            next[1].resolve(false);
+            session.pendingMessages.delete(next[0]);
+          }
+        }
       }
     }
-    throw new Error("Session did not end in result");
   }
 
   async cancel(params: CancelNotification): Promise<void> {
-    if (!this.sessions[params.sessionId]) {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
       throw new Error("Session not found");
     }
-    this.sessions[params.sessionId].cancelled = true;
-    await this.sessions[params.sessionId].query.interrupt();
+    session.cancelled = true;
+    for (const [, pending] of session.pendingMessages) {
+      pending.resolve(true);
+    }
+    session.pendingMessages.clear();
+    await session.query.interrupt();
   }
 
   async unstable_setSessionModel(
@@ -739,6 +858,7 @@ export class ClaudeAcpAgent implements Agent {
       throw new Error("Session not found");
     }
     await this.sessions[params.sessionId].query.setModel(params.modelId);
+    await this.updateConfigOption(params.sessionId, "model", params.modelId);
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -746,88 +866,98 @@ export class ClaudeAcpAgent implements Agent {
       throw new Error("Session not found");
     }
 
-    switch (params.modeId) {
+    await this.applySessionMode(params.sessionId, params.modeId);
+    await this.updateConfigOption(params.sessionId, "mode", params.modeId);
+    return {};
+  }
+
+  async setSessionConfigOption(
+    params: SetSessionConfigOptionRequest,
+  ): Promise<SetSessionConfigOptionResponse> {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
+      throw new Error("Session not found");
+    }
+
+    const option = session.configOptions.find((o) => o.id === params.configId);
+    if (!option) {
+      throw new Error(`Unknown config option: ${params.configId}`);
+    }
+
+    const allValues =
+      "options" in option && Array.isArray(option.options)
+        ? option.options.flatMap((o) => ("options" in o ? o.options : [o]))
+        : [];
+    const validValue = allValues.find((o) => o.value === params.value);
+    if (!validValue) {
+      throw new Error(`Invalid value for config option ${params.configId}: ${params.value}`);
+    }
+
+    if (params.configId === "mode") {
+      await this.applySessionMode(params.sessionId, params.value);
+      await this.client.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "current_mode_update",
+          currentModeId: params.value,
+        },
+      });
+    } else if (params.configId === "model") {
+      await this.sessions[params.sessionId].query.setModel(params.value);
+    }
+
+    session.configOptions = session.configOptions.map((o) =>
+      o.id === params.configId ? { ...o, currentValue: params.value } : o,
+    );
+
+    return { configOptions: session.configOptions };
+  }
+
+  private async applySessionMode(sessionId: string, modeId: string): Promise<void> {
+    switch (modeId) {
       case "default":
       case "acceptEdits":
       case "bypassPermissions":
       case "dontAsk":
       case "plan":
-        this.sessions[params.sessionId].permissionMode = params.modeId;
-        try {
-          await this.sessions[params.sessionId].query.setPermissionMode(params.modeId);
-        } catch (error) {
-          const errorMessage =
-            error instanceof Error && error.message ? error.message : "Invalid Mode";
-
-          throw new Error(errorMessage);
-        }
-        return {};
+        break;
       default:
         throw new Error("Invalid Mode");
     }
+    this.sessions[sessionId].permissionMode = modeId;
+    try {
+      await this.sessions[sessionId].query.setPermissionMode(modeId);
+    } catch (error) {
+      if (error instanceof Error) {
+        if (!error.message) {
+          error.message = "Invalid Mode";
+        }
+        throw error;
+      } else {
+        // eslint-disable-next-line preserve-caught-error
+        throw new Error("Invalid Mode");
+      }
+    }
   }
 
-  private async replaySessionHistory(sessionId: string, filePath: string): Promise<void> {
+  private async replaySessionHistory(sessionId: string): Promise<void> {
     const toolUseCache: ToolUseCache = {};
-    const stream = fs.createReadStream(filePath, { encoding: "utf-8" });
-    const reader = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    const messages = await getSessionMessages(sessionId);
 
-    try {
-      for await (const line of reader) {
-        const trimmed = line.trim();
-        if (!trimmed) {
-          continue;
-        }
-
-        let entry: SessionHistoryEntry;
-        try {
-          entry = JSON.parse(trimmed) as SessionHistoryEntry;
-        } catch {
-          continue;
-        }
-
-        if (entry.type !== "user" && entry.type !== "assistant") {
-          continue;
-        }
-
-        if (entry.isSidechain) {
-          continue;
-        }
-
-        if (entry.sessionId && entry.sessionId !== sessionId) {
-          continue;
-        }
-
-        const message = entry.message;
-        if (!message) {
-          continue;
-        }
-
-        const role =
-          message.role === "assistant" ? "assistant" : message.role === "user" ? "user" : null;
-        if (!role) {
-          continue;
-        }
-
-        const content = message.content;
-        if (typeof content !== "string" && !Array.isArray(content)) {
-          continue;
-        }
-
-        for (const notification of toAcpNotifications(
-          content,
-          role,
-          sessionId,
-          toolUseCache,
-          this.client,
-          this.logger,
-          { registerHooks: false },
-        )) {
-          await this.client.sessionUpdate(notification);
-        }
+    for (const message of messages) {
+      for (const notification of toAcpNotifications(
+        // @ts-expect-error - untyped in SDK but we handle all of these
+        message.message.content,
+        // @ts-expect-error - untyped in SDK but we handle all of these
+        message.message.role,
+        sessionId,
+        toolUseCache,
+        this.client,
+        this.logger,
+        { registerHooks: false, clientCapabilities: this.clientCapabilities },
+      )) {
+        await this.client.sessionUpdate(notification);
       }
-    } finally {
-      reader.close();
     }
   }
 
@@ -843,6 +973,7 @@ export class ClaudeAcpAgent implements Agent {
 
   canUseTool(sessionId: string): CanUseTool {
     return async (toolName, toolInput, { signal, suggestions, toolUseID }) => {
+      const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
       const session = this.sessions[sessionId];
       if (!session) {
         return {
@@ -867,7 +998,10 @@ export class ClaudeAcpAgent implements Agent {
           toolCall: {
             toolCallId: toolUseID,
             rawInput: toolInput,
-            title: toolInfoFromToolUse({ name: toolName, input: toolInput }).title,
+            ...toolInfoFromToolUse(
+              { name: toolName, input: toolInput, id: toolUseID },
+              supportsTerminalOutput,
+            ),
           },
         });
 
@@ -886,6 +1020,7 @@ export class ClaudeAcpAgent implements Agent {
               currentModeId: response.outcome.optionId,
             },
           });
+          await this.updateConfigOption(sessionId, "mode", response.outcome.optionId);
 
           return {
             behavior: "allow",
@@ -903,10 +1038,7 @@ export class ClaudeAcpAgent implements Agent {
         }
       }
 
-      if (
-        session.permissionMode === "bypassPermissions" ||
-        (session.permissionMode === "acceptEdits" && EDIT_TOOL_NAMES.includes(toolName))
-      ) {
+      if (session.permissionMode === "bypassPermissions") {
         return {
           behavior: "allow",
           updatedInput: toolInput,
@@ -930,7 +1062,10 @@ export class ClaudeAcpAgent implements Agent {
         toolCall: {
           toolCallId: toolUseID,
           rawInput: toolInput,
-          title: toolInfoFromToolUse({ name: toolName, input: toolInput }).title,
+          ...toolInfoFromToolUse(
+            { name: toolName, input: toolInput, id: toolUseID },
+            supportsTerminalOutput,
+          ),
         },
       });
       if (signal.aborted || response.outcome?.outcome === "cancelled") {
@@ -982,6 +1117,27 @@ export class ClaudeAcpAgent implements Agent {
     });
   }
 
+  private async updateConfigOption(
+    sessionId: string,
+    configId: string,
+    value: string,
+  ): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+
+    session.configOptions = session.configOptions.map((o) =>
+      o.id === configId ? { ...o, currentValue: value } : o,
+    );
+
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: session.configOptions,
+      },
+    });
+  }
+
   private async createSession(
     params: NewSessionRequest,
     creationOpts: { resume?: string; forkSession?: boolean } = {},
@@ -1028,16 +1184,6 @@ export class ClaudeAcpAgent implements Agent {
       }
     }
 
-    // Only add the acp MCP server if built-in tools are not disabled
-    if (!params._meta?.disableBuiltInTools) {
-      const server = createMcpServer(this, sessionId, this.clientCapabilities);
-      mcpServers["acp"] = {
-        type: "sdk",
-        name: "acp",
-        instance: server,
-      };
-    }
-
     let systemPrompt: Options["systemPrompt"] = { type: "preset", preset: "claude_code" };
     if (params._meta?.systemPrompt) {
       const customPrompt = params._meta.systemPrompt;
@@ -1052,7 +1198,9 @@ export class ClaudeAcpAgent implements Agent {
       }
     }
 
-    const permissionMode = "default";
+    const permissionMode = resolvePermissionMode(
+      settingsManager.getSettings().permissions?.defaultMode,
+    );
 
     // Extract options from _meta if provided
     const userProvidedOptions = (params._meta as NewSessionMeta | undefined)?.claudeCode?.options;
@@ -1062,12 +1210,40 @@ export class ClaudeAcpAgent implements Agent {
       ? parseInt(process.env.MAX_THINKING_TOKENS, 10)
       : undefined;
 
+    // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
+    const disallowedTools = ["AskUserQuestion"];
+
+    // Check if built-in tools should be disabled
+    if (params._meta?.disableBuiltInTools === true) {
+      // When built-in tools are disabled, explicitly disallow all of them
+      disallowedTools.push(
+        "Read",
+        "Write",
+        "Edit",
+        "Bash",
+        "Glob",
+        "Grep",
+        "Task",
+        "TodoWrite",
+        "ExitPlanMode",
+        "WebSearch",
+        "WebFetch",
+        "SlashCommand",
+        "Skill",
+        "NotebookEdit",
+      );
+    }
+
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],
-      stderr: (err) => this.logger.error(err),
       ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
       ...userProvidedOptions,
+      env: {
+        ...process.env,
+        ...userProvidedOptions?.env,
+        ...createEnvForGateway(this.gatewayAuthMeta),
+      },
       // Override certain fields that must be controlled by ACP
       cwd: params.cwd,
       includePartialMessages: true,
@@ -1080,18 +1256,20 @@ export class ClaudeAcpAgent implements Agent {
       // note: although not documented by the types, passing an absolute path
       // here works to find zed's managed node version.
       executable: process.execPath as any,
-      ...(process.env.CLAUDE_CODE_EXECUTABLE && {
-        pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE,
-      }),
+      executableArgs: isStaticBinary() ? ["--cli"] : undefined,
+      ...(process.env.CLAUDE_CODE_EXECUTABLE
+        ? { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE }
+        : isStaticBinary()
+          ? { pathToClaudeCodeExecutable: process.execPath }
+          : {}),
+      extraArgs: {
+        ...userProvidedOptions?.extraArgs,
+        "replay-user-messages": "",
+      },
+      disallowedTools: [...(userProvidedOptions?.disallowedTools || []), ...disallowedTools],
       tools: { type: "preset", preset: "claude_code" },
       hooks: {
         ...userProvidedOptions?.hooks,
-        PreToolUse: [
-          ...(userProvidedOptions?.hooks?.PreToolUse || []),
-          {
-            hooks: [createPreToolUseHook(settingsManager, this.logger)],
-          },
-        ],
         PostToolUse: [
           ...(userProvidedOptions?.hooks?.PostToolUse || []),
           {
@@ -1109,6 +1287,7 @@ export class ClaudeAcpAgent implements Agent {
                       currentModeId: "plan",
                     },
                   });
+                  await this.updateConfigOption(sessionId, "mode", "plan");
                 },
               }),
             ],
@@ -1123,61 +1302,6 @@ export class ClaudeAcpAgent implements Agent {
       options.sessionId = sessionId;
     }
 
-    const allowedTools = [];
-    // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
-    const disallowedTools = ["AskUserQuestion"];
-
-    // Check if built-in tools should be disabled
-    const disableBuiltInTools = params._meta?.disableBuiltInTools === true;
-
-    if (!disableBuiltInTools) {
-      if (this.clientCapabilities?.fs?.readTextFile) {
-        allowedTools.push(acpToolNames.read);
-        disallowedTools.push("Read");
-      }
-      if (this.clientCapabilities?.fs?.writeTextFile) {
-        disallowedTools.push("Write", "Edit");
-      }
-      if (this.clientCapabilities?.terminal) {
-        allowedTools.push(acpToolNames.bashOutput, acpToolNames.killShell);
-        disallowedTools.push("Bash", "BashOutput", "KillShell");
-      }
-    } else {
-      // When built-in tools are disabled, explicitly disallow all of them
-      disallowedTools.push(
-        acpToolNames.read,
-        acpToolNames.write,
-        acpToolNames.edit,
-        acpToolNames.bash,
-        acpToolNames.bashOutput,
-        acpToolNames.killShell,
-        "Read",
-        "Write",
-        "Edit",
-        "Bash",
-        "BashOutput",
-        "KillShell",
-        "Glob",
-        "Grep",
-        "Task",
-        "TodoWrite",
-        "ExitPlanMode",
-        "WebSearch",
-        "WebFetch",
-        "AskUserQuestion",
-        "SlashCommand",
-        "Skill",
-        "NotebookEdit",
-      );
-    }
-
-    if (allowedTools.length > 0) {
-      options.allowedTools = allowedTools;
-    }
-    if (disallowedTools.length > 0) {
-      options.disallowedTools = [...(options.disallowedTools || []), ...disallowedTools];
-    }
-
     // Handle abort controller from meta options
     const abortController = userProvidedOptions?.abortController;
     if (abortController?.signal.aborted) {
@@ -1189,15 +1313,26 @@ export class ClaudeAcpAgent implements Agent {
       options,
     });
 
-    this.sessions[sessionId] = {
-      query: q,
-      input: input,
-      cancelled: false,
-      permissionMode,
-      settingsManager,
-    };
+    let initializationResult;
+    try {
+      initializationResult = await q.initializationResult();
+    } catch (error) {
+      if (
+        creationOpts.resume &&
+        error instanceof Error &&
+        error.message === "Query closed before response received"
+      ) {
+        throw RequestError.resourceNotFound(sessionId);
+      }
+      throw error;
+    }
 
-    const initializationResult = await q.initializationResult();
+    if (shouldHideClaudeAuth() && initializationResult.account.subscriptionType) {
+      throw RequestError.authRequired(
+        undefined,
+        "This integration does not support using claude.ai subscriptions.",
+      );
+    }
 
     const models = await getAvailableModels(q, initializationResult.models, settingsManager);
 
@@ -1232,15 +1367,158 @@ export class ClaudeAcpAgent implements Agent {
       });
     }
 
+    const modes = {
+      currentModeId: permissionMode,
+      availableModes,
+    };
+
+    const configOptions = buildConfigOptions(modes, models);
+
+    this.sessions[sessionId] = {
+      query: q,
+      input: input,
+      cancelled: false,
+      permissionMode,
+      settingsManager,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions,
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+    };
+
     return {
       sessionId,
       models,
-      modes: {
-        currentModeId: permissionMode,
-        availableModes,
-      },
+      modes,
+      configOptions,
     };
   }
+}
+
+function createEnvForGateway(gatewayMeta?: GatewayAuthMeta) {
+  if (!gatewayMeta) {
+    return {};
+  }
+  return {
+    ANTHROPIC_BASE_URL: gatewayMeta.gateway.baseUrl,
+    ANTHROPIC_CUSTOM_HEADERS: Object.entries(gatewayMeta.gateway.headers)
+      .map(([key, value]) => `${key}: ${value}`)
+      .join("\n"),
+    ANTHROPIC_AUTH_TOKEN: "", // Must be specified to bypass claude login requirement
+  };
+}
+
+function buildConfigOptions(
+  modes: SessionModeState,
+  models: SessionModelState,
+): SessionConfigOption[] {
+  return [
+    {
+      id: "mode",
+      name: "Mode",
+      description: "Session permission mode",
+      category: "mode",
+      type: "select",
+      currentValue: modes.currentModeId,
+      options: modes.availableModes.map((m) => ({
+        value: m.id,
+        name: m.name,
+        description: m.description,
+      })),
+    },
+    {
+      id: "model",
+      name: "Model",
+      description: "AI model to use",
+      category: "model",
+      type: "select",
+      currentValue: models.currentModelId,
+      options: models.availableModels.map((m) => ({
+        value: m.modelId,
+        name: m.name,
+        description: m.description ?? undefined,
+      })),
+    },
+  ];
+}
+
+// Claude Code CLI persists display strings like "opus[1m]" in settings,
+// but the SDK model list uses IDs like "claude-opus-4-6-1m".
+const MODEL_CONTEXT_HINT_PATTERN = /\[(\d+m)\]$/i;
+
+function tokenizeModelPreference(model: string): { tokens: string[]; contextHint?: string } {
+  const lower = model.trim().toLowerCase();
+  const contextHint = lower.match(MODEL_CONTEXT_HINT_PATTERN)?.[1]?.toLowerCase();
+
+  const normalized = lower.replace(MODEL_CONTEXT_HINT_PATTERN, " $1 ");
+  const rawTokens = normalized.split(/[^a-z0-9]+/).filter(Boolean);
+  const tokens = rawTokens
+    .map((token) => {
+      if (token === "opusplan") return "opus";
+      if (token === "best" || token === "default") return "";
+      return token;
+    })
+    .filter((token) => token && token !== "claude")
+    .filter((token) => /[a-z]/.test(token) || token.endsWith("m"));
+
+  return { tokens, contextHint };
+}
+
+function scoreModelMatch(model: ModelInfo, tokens: string[], contextHint?: string): number {
+  const haystack = `${model.value} ${model.displayName}`.toLowerCase();
+  let score = 0;
+  for (const token of tokens) {
+    if (haystack.includes(token)) {
+      score += token === contextHint ? 3 : 1;
+    }
+  }
+  return score;
+}
+
+function resolveModelPreference(models: ModelInfo[], preference: string): ModelInfo | null {
+  const trimmed = preference.trim();
+  if (!trimmed) return null;
+
+  const lower = trimmed.toLowerCase();
+
+  // Exact match on value or display name
+  const directMatch = models.find(
+    (model) =>
+      model.value === trimmed ||
+      model.value.toLowerCase() === lower ||
+      model.displayName.toLowerCase() === lower,
+  );
+  if (directMatch) return directMatch;
+
+  // Substring match
+  const includesMatch = models.find((model) => {
+    const value = model.value.toLowerCase();
+    const display = model.displayName.toLowerCase();
+    return value.includes(lower) || display.includes(lower) || lower.includes(value);
+  });
+  if (includesMatch) return includesMatch;
+
+  // Tokenized matching for aliases like "opus[1m]"
+  const { tokens, contextHint } = tokenizeModelPreference(trimmed);
+  if (tokens.length === 0) return null;
+
+  let bestMatch: ModelInfo | null = null;
+  let bestScore = 0;
+  for (const model of models) {
+    const score = scoreModelMatch(model, tokens, contextHint);
+    if (0 < score && (!bestMatch || bestScore < score)) {
+      bestMatch = model;
+      bestScore = score;
+    }
+  }
+
+  return bestMatch;
 }
 
 async function getAvailableModels(
@@ -1253,14 +1531,7 @@ async function getAvailableModels(
   let currentModel = models[0];
 
   if (settings.model) {
-    const match = models.find(
-      (m) =>
-        m.value === settings.model ||
-        m.value.includes(settings.model!) ||
-        settings.model!.includes(m.value) ||
-        m.displayName.toLowerCase() === settings.model!.toLowerCase() ||
-        m.displayName.toLowerCase().includes(settings.model!.toLowerCase()),
-    );
+    const match = resolveModelPreference(models, settings.model);
     if (match) {
       currentModel = match;
     }
@@ -1418,22 +1689,34 @@ export function toAcpNotifications(
   toolUseCache: ToolUseCache,
   client: AgentSideConnection,
   logger: Logger,
-  options?: { registerHooks?: boolean },
+  options?: {
+    registerHooks?: boolean;
+    clientCapabilities?: ClientCapabilities;
+    parentToolUseId?: string | null;
+  },
 ): SessionNotification[] {
   const registerHooks = options?.registerHooks !== false;
+  const supportsTerminalOutput = options?.clientCapabilities?._meta?.["terminal_output"] === true;
   if (typeof content === "string") {
-    return [
-      {
-        sessionId,
-        update: {
-          sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
-          content: {
-            type: "text",
-            text: content,
-          },
-        },
+    const update: SessionNotification["update"] = {
+      sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
+      content: {
+        type: "text",
+        text: content,
       },
-    ];
+    };
+
+    if (options?.parentToolUseId) {
+      update._meta = {
+        ...update._meta,
+        claudeCode: {
+          ...(update._meta?.claudeCode || {}),
+          parentToolUseId: options.parentToolUseId,
+        },
+      };
+    }
+
+    return [{ sessionId, update }];
   }
 
   const output = [];
@@ -1475,6 +1758,7 @@ export function toAcpNotifications(
       case "tool_use":
       case "server_tool_use":
       case "mcp_tool_use": {
+        const alreadyCached = chunk.id in toolUseCache;
         toolUseCache[chunk.id] = chunk;
         if (chunk.name === "TodoWrite") {
           // @ts-expect-error - sometimes input is empty object
@@ -1485,11 +1769,14 @@ export function toAcpNotifications(
             };
           }
         } else {
-          if (registerHooks) {
+          // Only register hooks on first encounter to avoid double-firing
+          if (registerHooks && !alreadyCached) {
             registerHookCallback(chunk.id, {
               onPostToolUseHook: async (toolUseId, toolInput, toolResponse) => {
                 const toolUse = toolUseCache[toolUseId];
                 if (toolUse) {
+                  const editDiff =
+                    toolUse.name === "Edit" ? toolUpdateFromEditToolResponse(toolResponse) : {};
                   const update: SessionNotification["update"] = {
                     _meta: {
                       claudeCode: {
@@ -1499,6 +1786,7 @@ export function toAcpNotifications(
                     } satisfies ToolUpdateMeta,
                     toolCallId: toolUseId,
                     sessionUpdate: "tool_call_update",
+                    ...editDiff,
                   };
                   await client.sessionUpdate({
                     sessionId,
@@ -1506,7 +1794,7 @@ export function toAcpNotifications(
                   });
                 } else {
                   logger.error(
-                    `[claude-code-acp] Got a tool response for tool use that wasn't tracked: ${toolUseId}`,
+                    `[claude-agent-acp] Got a tool response for tool use that wasn't tracked: ${toolUseId}`,
                   );
                 }
               },
@@ -1519,18 +1807,41 @@ export function toAcpNotifications(
           } catch {
             // ignore if we can't turn it to JSON
           }
-          update = {
-            _meta: {
-              claudeCode: {
-                toolName: chunk.name,
-              },
-            } satisfies ToolUpdateMeta,
-            toolCallId: chunk.id,
-            sessionUpdate: "tool_call",
-            rawInput,
-            status: "pending",
-            ...toolInfoFromToolUse(chunk),
-          };
+
+          if (alreadyCached) {
+            // Second encounter (full assistant message after streaming) —
+            // send as tool_call_update to refine the existing tool_call
+            // rather than emitting a duplicate tool_call.
+            update = {
+              _meta: {
+                claudeCode: {
+                  toolName: chunk.name,
+                },
+              } satisfies ToolUpdateMeta,
+              toolCallId: chunk.id,
+              sessionUpdate: "tool_call_update",
+              rawInput,
+              ...toolInfoFromToolUse(chunk, supportsTerminalOutput),
+            };
+          } else {
+            // First encounter (streaming content_block_start or replay) —
+            // send as tool_call with terminal_info for Bash tools.
+            update = {
+              _meta: {
+                claudeCode: {
+                  toolName: chunk.name,
+                },
+                ...(chunk.name === "Bash" && supportsTerminalOutput
+                  ? { terminal_info: { terminal_id: chunk.id } }
+                  : {}),
+              } satisfies ToolUpdateMeta,
+              toolCallId: chunk.id,
+              sessionUpdate: "tool_call",
+              rawInput,
+              status: "pending",
+              ...toolInfoFromToolUse(chunk, supportsTerminalOutput),
+            };
+          }
         }
         break;
       }
@@ -1546,23 +1857,51 @@ export function toAcpNotifications(
         const toolUse = toolUseCache[chunk.tool_use_id];
         if (!toolUse) {
           logger.error(
-            `[claude-code-acp] Got a tool result for tool use that wasn't tracked: ${chunk.tool_use_id}`,
+            `[claude-agent-acp] Got a tool result for tool use that wasn't tracked: ${chunk.tool_use_id}`,
           );
           break;
         }
 
         if (toolUse.name !== "TodoWrite") {
+          const { _meta: toolMeta, ...toolUpdate } = toolUpdateFromToolResult(
+            chunk,
+            toolUseCache[chunk.tool_use_id],
+            supportsTerminalOutput,
+          );
+
+          // When terminal output is supported, send terminal_output as a
+          // separate notification to match codex-acp's streaming lifecycle:
+          //   1. tool_call       → _meta.terminal_info  (already sent above)
+          //   2. tool_call_update → _meta.terminal_output (sent here)
+          //   3. tool_call_update → _meta.terminal_exit  (sent below with status)
+          if (toolMeta?.terminal_output) {
+            output.push({
+              sessionId,
+              update: {
+                _meta: {
+                  terminal_output: toolMeta.terminal_output,
+                  ...(options?.parentToolUseId
+                    ? { claudeCode: { parentToolUseId: options.parentToolUseId } }
+                    : {}),
+                },
+                toolCallId: chunk.tool_use_id,
+                sessionUpdate: "tool_call_update" as const,
+              },
+            });
+          }
+
           update = {
             _meta: {
               claudeCode: {
                 toolName: toolUse.name,
               },
+              ...(toolMeta?.terminal_exit ? { terminal_exit: toolMeta.terminal_exit } : {}),
             } satisfies ToolUpdateMeta,
             toolCallId: chunk.tool_use_id,
             sessionUpdate: "tool_call_update",
             status: "is_error" in chunk && chunk.is_error ? "failed" : "completed",
             rawOutput: chunk.content,
-            ...toolUpdateFromToolResult(chunk, toolUseCache[chunk.tool_use_id]),
+            ...toolUpdate,
           };
         }
         break;
@@ -1584,6 +1923,15 @@ export function toAcpNotifications(
         break;
     }
     if (update) {
+      if (options?.parentToolUseId) {
+        update._meta = {
+          ...update._meta,
+          claudeCode: {
+            ...(update._meta?.claudeCode || {}),
+            parentToolUseId: options.parentToolUseId,
+          },
+        };
+      }
       output.push({ sessionId, update });
     }
   }
@@ -1597,6 +1945,7 @@ export function streamEventToAcpNotifications(
   toolUseCache: ToolUseCache,
   client: AgentSideConnection,
   logger: Logger,
+  options?: { clientCapabilities?: ClientCapabilities },
 ): SessionNotification[] {
   const event = message.event;
   switch (event.type) {
@@ -1608,6 +1957,10 @@ export function streamEventToAcpNotifications(
         toolUseCache,
         client,
         logger,
+        {
+          clientCapabilities: options?.clientCapabilities,
+          parentToolUseId: message.parent_tool_use_id,
+        },
       );
     case "content_block_delta":
       return toAcpNotifications(
@@ -1617,6 +1970,10 @@ export function streamEventToAcpNotifications(
         toolUseCache,
         client,
         logger,
+        {
+          clientCapabilities: options?.clientCapabilities,
+          parentToolUseId: message.parent_tool_use_id,
+        },
       );
     // No content
     case "message_start":
