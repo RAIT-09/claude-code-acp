@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.22.0
+
+- Use stable list sessions method (#429)
+- Use correct Claude CLI path for static binaries (#428)
+- Update claude-agent-sdk to 0.2.76 (#427)
+- fix: resolve model aliases in setSessionConfigOption (#401) (#403)
+- Reuse existing sessions for load/resume if possible (#426)
+- Remove interrupt flag from deny responses (#425)
+- Allow Bypass permissions mode after Exiting plan (#410)
+- Don't get out of sync when background task creates new init/result (try 2) (#400)
+- Add session/close support (#409)
+
+## 0.21.0
+
+- Update to claude-agent-sdk 0.2.71
+- show project-relative paths in tool call titles
+- Lib: pass through tools array to control built-in tool availability
+- fix: skip user replay
+- fix: handle renamed Agent tool in toolInfoFromToolUse
+
+## 0.20.2
+
+- Update to @anthropic-ai/claude-agent-sdk@0.2.68
+
 ## 0.20.1
 
 - fix: inherit process.env when spawning agent subprocess
