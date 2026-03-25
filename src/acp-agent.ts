@@ -156,6 +156,7 @@ export type NewSessionMeta = {
      */
     options?: Options;
   };
+  additionalRoots?: string[];
 };
 
 /**
@@ -225,6 +226,10 @@ function shouldHideClaudeAuth(): boolean {
 // Bypass Permissions doesn't work if we are a root/sudo user
 const IS_ROOT = (process.geteuid?.() ?? process.getuid?.()) === 0;
 const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
+
+// Slash commands that the SDK handles locally without replaying the user
+// message and without invoking the model.
+const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
 
 const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   default: "default",
@@ -470,6 +475,16 @@ export class ClaudeAcpAgent implements Agent {
 
     let promptReplayed = false;
 
+    // These local-only commands return a result without replaying the user
+    // message. Mark promptReplayed=true so their result isn't consumed as a
+    // background task result.
+    const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+    const isLocalOnlyCommand =
+      firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
+    if (isLocalOnlyCommand) {
+      promptReplayed = true;
+    }
+
     if (session.promptRunning) {
       session.input.push(userMessage);
       const order = session.nextPendingOrder++;
@@ -585,16 +600,20 @@ export class ClaudeAcpAgent implements Agent {
               });
             }
 
+            // Check cancelled before promptReplayed — when a cancel races
+            // with the first result, promptReplayed is still false and the
+            // result would be consumed as a background task, blocking the
+            // loop forever (see #442).
+            if (session.cancelled) {
+              return { stopReason: "cancelled" };
+            }
+
             if (!promptReplayed) {
               // This result is from a background task that finished after
               // the previous prompt loop ended. Consume it and continue
               // waiting for our own prompt's result.
               this.logger.log(`Session ${params.sessionId}: consuming background task result`);
               break;
-            }
-
-            if (session.cancelled) {
-              return { stopReason: "cancelled" };
             }
 
             // Build the usage response
@@ -620,6 +639,20 @@ export class ClaudeAcpAgent implements Agent {
                 }
                 if (message.is_error) {
                   throw RequestError.internalError(undefined, message.result);
+                }
+                // For local-only commands (no model invocation), the result
+                // text is the command output — forward it to the client.
+                if (isLocalOnlyCommand) {
+                  for (const notification of toAcpNotifications(
+                    message.result,
+                    "assistant",
+                    params.sessionId,
+                    this.toolUseCache,
+                    this.client,
+                    this.logger,
+                  )) {
+                    await this.client.sessionUpdate(notification);
+                  }
                 }
                 return { stopReason: "end_turn", usage };
               }
@@ -711,22 +744,6 @@ export class ClaudeAcpAgent implements Agent {
               typeof message.message.content === "string" &&
               message.message.content.includes("<local-command-stdout>")
             ) {
-              // Handle /context by sending its reply as regular agent message.
-              if (message.message.content.includes("Context Usage")) {
-                for (const notification of toAcpNotifications(
-                  message.message.content
-                    .replace("<local-command-stdout>", "")
-                    .replace("</local-command-stdout>", ""),
-                  "assistant",
-                  params.sessionId,
-                  this.toolUseCache,
-                  this.client,
-                  this.logger,
-                  { clientCapabilities: this.clientCapabilities },
-                )) {
-                  await this.client.sessionUpdate(notification);
-                }
-              }
               this.logger.log(message.message.content);
               break;
             }
@@ -810,6 +827,7 @@ export class ClaudeAcpAgent implements Agent {
         message.includes("Failed to write to process stdin")
       ) {
         this.logger.error(`Session ${params.sessionId}: Claude Agent process died: ${message}`);
+        session.settingsManager.dispose();
         session.input.end();
         delete this.sessions[params.sessionId];
         throw RequestError.internalError(
@@ -857,6 +875,7 @@ export class ClaudeAcpAgent implements Agent {
     }
     await this.cancel({ sessionId: params.sessionId });
 
+    session.settingsManager.dispose();
     session.abortController.abort();
     delete this.sessions[params.sessionId];
 
@@ -1299,7 +1318,8 @@ export class ClaudeAcpAgent implements Agent {
     );
 
     // Extract options from _meta if provided
-    const userProvidedOptions = (params._meta as NewSessionMeta | undefined)?.claudeCode?.options;
+    const sessionMeta = params._meta as NewSessionMeta | undefined;
+    const userProvidedOptions = sessionMeta?.claudeCode?.options;
 
     // Configure thinking tokens from environment variable
     const maxThinkingTokens = process.env.MAX_THINKING_TOKENS
@@ -1378,6 +1398,11 @@ export class ClaudeAcpAgent implements Agent {
       abortController,
     };
 
+    options.additionalDirectories = [
+      ...(userProvidedOptions?.additionalDirectories ?? []),
+      ...(sessionMeta?.additionalRoots ?? []),
+    ];
+
     if (creationOpts?.resume === undefined || creationOpts?.forkSession) {
       // Set our own session id if not resuming an existing session.
       options.sessionId = sessionId;
@@ -1407,7 +1432,11 @@ export class ClaudeAcpAgent implements Agent {
       throw error;
     }
 
-    if (shouldHideClaudeAuth() && initializationResult.account.subscriptionType) {
+    if (
+      shouldHideClaudeAuth() &&
+      initializationResult.account.subscriptionType &&
+      !this.gatewayAuthMeta
+    ) {
       throw RequestError.authRequired(
         undefined,
         "This integration does not support using claude.ai subscriptions.",
